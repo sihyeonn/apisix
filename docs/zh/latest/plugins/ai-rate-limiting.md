@@ -45,6 +45,10 @@ description: ai-rate-limiting 插件对发送到 LLM 服务的请求实施基于
 | time_window                  | integer        | 否    |          | >0                             | 与速率限制 `limit` 对应的时间间隔（秒）。`time_window` 和 `instances.time_window` 中至少应配置一个。 |
 | show_limit_quota_header      | boolean        | 否    | true     |                                                         | 如果为 true，则在响应中包含 `X-AI-RateLimit-Limit-*`、`X-AI-RateLimit-Remaining-*` 和 `X-AI-RateLimit-Reset-*` 头部，其中 `*` 是实例名称。 |
 | limit_strategy               | string         | 否    | total_tokens | [total_tokens, prompt_tokens, completion_tokens] | 应用速率限制的令牌类型。`total_tokens` 是 `prompt_tokens` 和 `completion_tokens` 的总和。 |
+| enable_estimated_token_charging | boolean     | 否    | false    |                                                         | 启用后，将在 access 阶段按请求 messages 内容长度估算并扣减 prompt tokens，并在流式响应时按 chunk 内容长度逐步估算并扣减 completion tokens，以降低通过提前关闭流式请求进行绕过的可能性。禁用（默认）时将保持兼容行为：在 log 阶段按上游返回的 usage 精确扣减。 |
+| prompt_tokens_estimator_divisor | integer     | 否    | 4        | >0                                                      | prompt tokens 估算公式为 `ceil(utf8_bytes / divisor)`，divisor 越大估算值越小。仅在 `enable_estimated_token_charging` 启用时生效。 |
+| completion_tokens_estimator_divisor | integer | 否    | 4        | >0                                                      | completion tokens 估算公式为 `ceil(utf8_bytes / divisor)`。仅在 `enable_estimated_token_charging` 启用时生效。 |
+| stream_commit_tokens         | integer        | 否    | 50       | >0                                                      | 流式响应时按批次提交扣减的 token 数阈值，用于降低 limiter 调用开销。仅在 `enable_estimated_token_charging` 启用时生效。 |
 | instances                    | array[object]  | 否    |          |                                                         | LLM 实例速率限制配置。 |
 | instances.name               | string         | 是     |          |                                                         | LLM 服务实例的名称。 |
 | instances.limit              | integer        | 是     |          | >0                             | 实例在给定时间间隔内允许的最大令牌数。 |
