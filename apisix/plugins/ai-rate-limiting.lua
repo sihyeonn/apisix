@@ -45,6 +45,32 @@ local schema = {
             default = "total_tokens",
             description = "The strategy to limit the tokens"
         },
+
+        -- Opt-in estimation-based charging mode.
+        enable_estimated_token_charging = {
+            type = "boolean",
+            default = false,
+            description = "Enable estimation-based charging to mitigate bypass by closing streaming requests early."
+        },
+
+        prompt_tokens_estimator_divisor = {
+            type = "integer",
+            minimum = 1,
+            default = 4,
+            description = "Estimated prompt tokens = ceil(utf8_bytes / divisor). Larger divisor => less charging."
+        },
+        completion_tokens_estimator_divisor = {
+            type = "integer",
+            minimum = 1,
+            default = 4,
+            description = "Estimated completion tokens = ceil(utf8_bytes / divisor)."
+        },
+        stream_commit_tokens = {
+            type = "integer",
+            minimum = 1,
+            default = 50,
+            description = "Commit completion token cost in batches to reduce limiter overhead."
+        },
         instances = {
             type = "array",
             items = instance_limit_schema,
@@ -72,7 +98,7 @@ local schema = {
 }
 
 local _M = {
-    version = 0.1,
+    version = 0.2,
     priority = 1030,
     name = plugin_name,
     schema = schema
@@ -85,6 +111,55 @@ local limit_conf_cache = core.lrucache.new({
 
 function _M.check_schema(conf)
     return core.schema.check(schema, conf)
+end
+
+
+local function estimate_tokens_from_text(text, divisor)
+    if type(text) ~= "string" or text == "" then
+        return 0
+    end
+
+    divisor = divisor or 4
+    if divisor <= 0 then
+        divisor = 4
+    end
+
+    return math.ceil(#text / divisor)
+end
+
+
+local function estimate_prompt_tokens(conf, ctx)
+    local body_tab, err = core.request.get_json_request_body_table()
+    if not body_tab then
+        core.log.debug("failed to decode request body for prompt estimation: ",
+            err and core.json.delay_encode(err) or "nil")
+        return 1
+    end
+
+    local messages = body_tab.messages
+    if type(messages) ~= "table" then
+        return 1
+    end
+
+    local parts = {}
+    for _, msg in ipairs(messages) do
+        if type(msg) == "table" then
+            local c = msg.content
+            if type(c) == "string" then
+                parts[#parts + 1] = c
+            elseif type(c) == "table" then
+                parts[#parts + 1] = core.json.encode(c)
+            end
+        end
+    end
+
+    local all = table.concat(parts, " ")
+    local est = estimate_tokens_from_text(all, conf.prompt_tokens_estimator_divisor)
+
+    if est <= 0 then
+        return 1
+    end
+    return est
 end
 
 
@@ -150,12 +225,34 @@ function _M.access(conf, ctx)
 
     local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
     local limit_conf = limit_conf_kvs[ai_instance_name]
-    if not limit_conf then
-        return
+    if not conf.enable_estimated_token_charging then
+        local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, 1, true)
+        ctx.ai_rate_limiting = code and true or false
+        return code, msg
     end
-    local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, 1, true)
+
+    local access_cost
+    local prompt_tokens_est
+    if should_charge_prompt(conf) then
+        prompt_tokens_est = estimate_prompt_tokens(conf, ctx)
+        ctx.ai_rate_limiting_prompt_tokens_est = prompt_tokens_est
+        access_cost = prompt_tokens_est
+    else
+        access_cost = 1
+    end
+
+    local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, access_cost, true)
     ctx.ai_rate_limiting = code and true or false
-    return code, msg
+    if code then
+        return code, msg
+    end
+
+    if should_charge_prompt(conf) and prompt_tokens_est and prompt_tokens_est > 0 then
+        local commit_conf = core.table.clone(limit_conf)
+        commit_conf.show_limit_quota_header = false
+        limit_count.rate_limit(commit_conf, ctx, plugin_name, prompt_tokens_est)
+        ctx.ai_rate_limiting_prompt_charged = true
+    end
 end
 
 
@@ -205,6 +302,76 @@ local function get_token_usage(conf, ctx)
 end
 
 
+local function commit_completion_cost(conf, ctx, limit_conf, cost)
+    if not cost or cost <= 0 then
+        return
+    end
+
+    local commit_conf = core.table.clone(limit_conf)
+    commit_conf.show_limit_quota_header = false
+
+    local code, err = limit_count.rate_limit(commit_conf, ctx, plugin_name, cost)
+    if code then
+        ctx.ai_rate_limiting_completion_rejected = true
+        core.log.info("ai-rate-limiting completion cost rejected (will block next requests): ",
+            "instance=", ctx.picked_ai_instance_name, ", code=", code,
+            ", err=", err and core.json.delay_encode(err) or "")
+    end
+end
+
+
+function _M.lua_body_filter(conf, ctx, headers, body)
+    if not conf.enable_estimated_token_charging then
+        return
+    end
+
+    if ctx.ai_rate_limiting then
+        return
+    end
+
+    if not should_charge_completion(conf) then
+        return
+    end
+    local chunk_contents = ctx.llm_response_contents_in_chunk
+    local chunk_text
+    if type(chunk_contents) == "table" and #chunk_contents > 0 then
+        chunk_text = table.concat(chunk_contents, "")
+    end
+
+    local add = estimate_tokens_from_text(chunk_text, conf.completion_tokens_estimator_divisor)
+
+    local pending = (ctx.ai_rate_limiting_completion_pending or 0) + add
+    ctx.ai_rate_limiting_completion_pending = pending
+
+    local should_flush = false
+    if ctx.var.llm_request_done then
+        should_flush = true
+    elseif pending >= (conf.stream_commit_tokens or 50) then
+        should_flush = true
+    end
+
+    if not should_flush or pending <= 0 then
+        return
+    end
+
+    ctx.ai_rate_limiting_completion_pending = 0
+    ctx.ai_rate_limiting_completion_charged = (ctx.ai_rate_limiting_completion_charged or 0) + pending
+
+    local instance_name = ctx.picked_ai_instance_name
+    if not instance_name then
+        return
+    end
+
+    local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
+    local limit_conf = limit_conf_kvs[instance_name]
+    if not limit_conf then
+        return
+    end
+
+    commit_completion_cost(conf, ctx, limit_conf, pending)
+end
+
+
 function _M.log(conf, ctx)
     local instance_name = ctx.picked_ai_instance_name
     if not instance_name then
@@ -214,19 +381,52 @@ function _M.log(conf, ctx)
     if ctx.ai_rate_limiting then
         return
     end
+    if not conf.enable_estimated_token_charging then
+        local used_tokens = get_token_usage(conf, ctx)
+        if not used_tokens then
+            core.log.error("failed to get token usage for llm service")
+            return
+        end
 
-    local used_tokens = get_token_usage(conf, ctx)
-    if not used_tokens then
-        core.log.error("failed to get token usage for llm service")
+        core.log.info("instance name: ", instance_name, " used tokens: ", used_tokens)
+
+        local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
+        local limit_conf = limit_conf_kvs[instance_name]
+        if limit_conf then
+            limit_count.rate_limit(limit_conf, ctx, plugin_name, used_tokens)
+        end
         return
     end
 
-    core.log.info("instance name: ", instance_name, " used tokens: ", used_tokens)
-
     local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
     local limit_conf = limit_conf_kvs[instance_name]
-    if limit_conf then
-        limit_count.rate_limit(limit_conf, ctx, plugin_name, used_tokens)
+
+    if not limit_conf then
+        return
+    end
+
+    local pending = ctx.ai_rate_limiting_completion_pending or 0
+    if pending > 0 then
+        ctx.ai_rate_limiting_completion_pending = 0
+        ctx.ai_rate_limiting_completion_charged = (ctx.ai_rate_limiting_completion_charged or 0) + pending
+        commit_completion_cost(conf, ctx, limit_conf, pending)
+    end
+    if should_charge_completion(conf)
+            and ctx.var.request_type == "ai_chat"
+            and not ctx.ai_rate_limiting_completion_charged then
+        local completion_est = estimate_tokens_from_text(ctx.var.llm_response_text,
+            conf.completion_tokens_estimator_divisor)
+        if completion_est > 0 then
+            ctx.ai_rate_limiting_completion_charged = completion_est
+            commit_completion_cost(conf, ctx, limit_conf, completion_est)
+        end
+    end
+
+    local used_tokens = get_token_usage(conf, ctx)
+    if used_tokens then
+        core.log.info("instance name: ", instance_name, " used tokens (upstream usage): ", used_tokens,
+            ", prompt_est=", ctx.ai_rate_limiting_prompt_tokens_est or 0,
+            ", completion_est_charged=", ctx.ai_rate_limiting_completion_charged or 0)
     end
 end
 
