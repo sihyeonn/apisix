@@ -28,8 +28,7 @@ open(my $fh, '<', $resp_file) or die "Could not open file '$resp_file' $!";
 my $resp = do { local $/; <$fh> };
 close($fh);
 
-print "Hello, World!\n";
-print $resp;
+# NOTE: keep the test output clean. Avoid printing debug strings.
 
 
 add_block_preprocessor(sub {
@@ -984,3 +983,72 @@ passed
 Authorization: Bearer token
 --- error_code eval
 [200, 200, 200, 200, 200, 200, 200, 503, 503]
+
+
+=== TEST 21: estimated token charging should be optional and work for non-streaming (ai_chat)
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/routes/3',
+                 ngx.HTTP_PUT,
+                 [[{
+                    "uri": "/ai3",
+                    "plugins": {
+                        "ai-proxy": {
+                            "provider": "openai",
+                            "auth": {
+                                "header": {
+                                    "Authorization": "Bearer token"
+                                }
+                            },
+                            "options": {
+                                "model": "gpt-35-turbo-instruct",
+                                "max_tokens": 512,
+                                "temperature": 1.0
+                            },
+                            "override": {
+                                "endpoint": "http://localhost:16724"
+                            },
+                            "ssl_verify": false
+                        },
+                        "ai-rate-limiting": {
+                            "limit": 20,
+                            "time_window": 60,
+                            "limit_strategy": "total_tokens",
+                            "enable_estimated_token_charging": true,
+                            "prompt_tokens_estimator_divisor": 4,
+                            "completion_tokens_estimator_divisor": 4
+                        }
+                    },
+                    "upstream": {
+                        "type": "roundrobin",
+                        "nodes": {
+                            "canbeanything.com": 1
+                        }
+                    }
+                }]]
+            )
+
+            if code >= 300 then
+                ngx.status = code
+            end
+            ngx.say(body)
+        }
+    }
+--- response_body
+passed
+
+
+
+=== TEST 22: estimated token charging should limit based on estimated prompt+completion
+--- pipelined_requests eval
+[
+    "POST /ai3\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }",
+    "POST /ai3\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }",
+    "POST /ai3\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }"
+]
+--- more_headers
+Authorization: Bearer token
+--- error_code eval
+[200, 200, 503]
