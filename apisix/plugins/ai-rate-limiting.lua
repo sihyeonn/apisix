@@ -23,9 +23,6 @@ local limit_count = require("apisix.plugins.limit-count.init")
 
 local plugin_name = "ai-rate-limiting"
 
-local table_concat = table.concat
-local math_ceil = math.ceil
-
 local instance_limit_schema = {
     type = "object",
     properties = {
@@ -49,24 +46,13 @@ local schema = {
             description = "The strategy to limit the tokens"
         },
 
-        -- Keep backwards compatible behavior by default.
-        -- When disabled (default):
-        --   - access phase only checks availability with cost=1 (dry-run)
-        --   - log phase charges exact usage tokens from upstream (ctx.ai_token_usage)
-        -- When enabled:
-        --   - access phase charges estimated prompt tokens once
-        --   - streaming chunk charges estimated completion tokens progressively
-        --   - upstream usage is for observability only
+        -- Opt-in estimation-based charging mode.
         enable_estimated_token_charging = {
             type = "boolean",
             default = false,
             description = "Enable estimation-based charging to mitigate bypass by closing streaming requests early."
         },
 
-        -- Estimation-based charging to mitigate bypass by closing streaming requests early.
-        -- We charge prompt tokens once in access phase (based on request messages length),
-        -- and charge completion tokens progressively during streaming (based on chunk content length).
-        -- Usage returned by upstream (if any) is used for observability only.
         prompt_tokens_estimator_divisor = {
             type = "integer",
             minimum = 1,
@@ -138,8 +124,7 @@ local function estimate_tokens_from_text(text, divisor)
         divisor = 4
     end
 
-    -- Lua string length is byte length, which matches utf8-bytes for typical request bodies.
-    return math_ceil(#text / divisor)
+    return math.ceil(#text / divisor)
 end
 
 
@@ -153,7 +138,6 @@ local function estimate_prompt_tokens(conf, ctx)
 
     local messages = body_tab.messages
     if type(messages) ~= "table" then
-        -- fallback: charge minimally
         return 1
     end
 
@@ -164,13 +148,12 @@ local function estimate_prompt_tokens(conf, ctx)
             if type(c) == "string" then
                 parts[#parts + 1] = c
             elseif type(c) == "table" then
-                -- content may be array/object (multimodal). Encode to keep rough size.
                 parts[#parts + 1] = core.json.encode(c)
             end
         end
     end
 
-    local all = table_concat(parts, " ")
+    local all = table.concat(parts, " ")
     local est = estimate_tokens_from_text(all, conf.prompt_tokens_estimator_divisor)
 
     if est <= 0 then
@@ -242,20 +225,12 @@ function _M.access(conf, ctx)
 
     local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
     local limit_conf = limit_conf_kvs[ai_instance_name]
-    if not limit_conf then
-        return
-    end
-
-    -- Backwards compatible behavior (default): only check at access phase,
-    -- and charge the exact token usage in log phase.
     if not conf.enable_estimated_token_charging then
         local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, 1, true)
         ctx.ai_rate_limiting = code and true or false
         return code, msg
     end
 
-    -- (A) Prompt tokens: estimate & charge once at request start.
-    -- Use a dry-run check first to avoid charging rejected requests.
     local access_cost
     local prompt_tokens_est
     if should_charge_prompt(conf) then
@@ -263,8 +238,6 @@ function _M.access(conf, ctx)
         ctx.ai_rate_limiting_prompt_tokens_est = prompt_tokens_est
         access_cost = prompt_tokens_est
     else
-        -- Completion-only strategy: we can't know the completion cost at request start.
-        -- Still do a minimal dry-run check to reject requests when quota is fully exhausted.
         access_cost = 1
     end
 
@@ -275,7 +248,6 @@ function _M.access(conf, ctx)
     end
 
     if should_charge_prompt(conf) and prompt_tokens_est and prompt_tokens_est > 0 then
-        -- Commit prompt token cost (avoid header mutation twice).
         local commit_conf = core.table.clone(limit_conf)
         commit_conf.show_limit_quota_header = false
         limit_count.rate_limit(commit_conf, ctx, plugin_name, prompt_tokens_est)
@@ -335,12 +307,9 @@ local function commit_completion_cost(conf, ctx, limit_conf, cost)
         return
     end
 
-    -- Do not mutate response headers during streaming/body_filter.
     local commit_conf = core.table.clone(limit_conf)
     commit_conf.show_limit_quota_header = false
 
-    -- Ignore reject result here; we only need to make sure the counter reaches the limit
-    -- so that subsequent requests are blocked.
     local code, err = limit_count.rate_limit(commit_conf, ctx, plugin_name, cost)
     if code then
         ctx.ai_rate_limiting_completion_rejected = true
@@ -363,12 +332,10 @@ function _M.lua_body_filter(conf, ctx, headers, body)
     if not should_charge_completion(conf) then
         return
     end
-
-    -- (B) Completion tokens: progressively charge based on streamed chunk content.
     local chunk_contents = ctx.llm_response_contents_in_chunk
     local chunk_text
     if type(chunk_contents) == "table" and #chunk_contents > 0 then
-        chunk_text = table_concat(chunk_contents, "")
+        chunk_text = table.concat(chunk_contents, "")
     end
 
     local add = estimate_tokens_from_text(chunk_text, conf.completion_tokens_estimator_divisor)
@@ -414,8 +381,6 @@ function _M.log(conf, ctx)
     if ctx.ai_rate_limiting then
         return
     end
-
-    -- Backwards compatible behavior (default): charge exact usage tokens at log phase.
     if not conf.enable_estimated_token_charging then
         local used_tokens = get_token_usage(conf, ctx)
         if not used_tokens then
@@ -440,15 +405,12 @@ function _M.log(conf, ctx)
         return
     end
 
-    -- Flush any pending completion estimate (e.g. last partial batch).
     local pending = ctx.ai_rate_limiting_completion_pending or 0
     if pending > 0 then
         ctx.ai_rate_limiting_completion_pending = 0
         ctx.ai_rate_limiting_completion_charged = (ctx.ai_rate_limiting_completion_charged or 0) + pending
         commit_completion_cost(conf, ctx, limit_conf, pending)
     end
-
-    -- For non-streaming responses, charge completion once based on final response text.
     if should_charge_completion(conf)
             and ctx.var.request_type == "ai_chat"
             and not ctx.ai_rate_limiting_completion_charged then
@@ -460,7 +422,6 @@ function _M.log(conf, ctx)
         end
     end
 
-    -- (C) Upstream usage, if any, is for observability only.
     local used_tokens = get_token_usage(conf, ctx)
     if used_tokens then
         core.log.info("instance name: ", instance_name, " used tokens (upstream usage): ", used_tokens,
