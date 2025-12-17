@@ -277,11 +277,11 @@ function _M.access(conf, ctx)
         return code, msg
     end
 
-    if should_charge_prompt(conf) and prompt_tokens_est and prompt_tokens_est > 0 then
+    if should_charge_prompt(conf) and access_cost and access_cost > 0 then
         local commit_conf = core.table.clone(limit_conf)
         commit_conf.show_limit_quota_header = false
-        limit_count.rate_limit(commit_conf, ctx, plugin_name, prompt_tokens_est)
-        ctx.ai_rate_limiting_prompt_charged = true
+        limit_count.rate_limit(commit_conf, ctx, plugin_name, access_cost)
+        ctx.ai_rate_limiting_prompt_charged = access_cost
     end
 end
 
