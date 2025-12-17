@@ -23,6 +23,8 @@ local limit_count = require("apisix.plugins.limit-count.init")
 
 local plugin_name = "ai-rate-limiting"
 
+local MIN_ESTIMATED_TOKENS = 1
+
 local instance_limit_schema = {
     type = "object",
     properties = {
@@ -133,12 +135,12 @@ local function estimate_prompt_tokens(conf, ctx)
     if not body_tab then
         core.log.debug("failed to decode request body for prompt estimation: ",
             err and core.json.delay_encode(err) or "nil")
-        return 1
+        return MIN_ESTIMATED_TOKENS
     end
 
     local messages = body_tab.messages
     if type(messages) ~= "table" then
-        return 1
+        return MIN_ESTIMATED_TOKENS
     end
 
     local parts = {}
@@ -175,7 +177,7 @@ local function estimate_prompt_tokens(conf, ctx)
     local est = estimate_tokens_from_text(all, conf.prompt_tokens_estimator_divisor)
 
     if est <= 0 then
-        return 1
+        return MIN_ESTIMATED_TOKENS
     end
     return est
 end
@@ -256,7 +258,7 @@ function _M.access(conf, ctx)
         ctx.ai_rate_limiting_prompt_tokens_est = prompt_tokens_est
         access_cost = prompt_tokens_est
     else
-        access_cost = 1
+        access_cost = MIN_ESTIMATED_TOKENS
     end
 
     local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, access_cost, true)
