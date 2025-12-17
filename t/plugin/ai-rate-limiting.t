@@ -1121,3 +1121,249 @@ passed
 Authorization: Bearer token
 --- error_code eval
 [200, 200, 503]
+
+
+=== TEST 25: estimated charging with prompt_tokens strategy should ignore completion
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/routes/5',
+                 ngx.HTTP_PUT,
+                 [[{
+                    "uri": "/ai5",
+                    "plugins": {
+                        "ai-proxy": {
+                            "provider": "openai",
+                            "auth": {"header": {"Authorization": "Bearer token"}},
+                            "options": {
+                                "model": "gpt-35-turbo-instruct",
+                                "max_tokens": 512,
+                                "temperature": 1.0
+                            },
+                            "override": {"endpoint": "http://localhost:16724"},
+                            "ssl_verify": false
+                        },
+                        "ai-rate-limiting": {
+                            "limit": 18,
+                            "time_window": 60,
+                            "limit_strategy": "prompt_tokens",
+                            "enable_estimated_token_charging": true,
+                            "prompt_tokens_estimator_divisor": 4,
+                            "completion_tokens_estimator_divisor": 4
+                        }
+                    },
+                    "upstream": {
+                        "type": "roundrobin",
+                        "nodes": {"canbeanything.com": 1}
+                    }
+                }]]
+            )
+
+            if code >= 300 then
+                ngx.status = code
+            end
+            ngx.say(body)
+        }
+    }
+--- response_body
+passed
+
+
+
+=== TEST 26: prompt_tokens strategy should reject the 3rd request
+--- pipelined_requests eval
+[
+    "POST /ai5\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }",
+    "POST /ai5\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }",
+    "POST /ai5\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }"
+]
+--- more_headers
+Authorization: Bearer token
+--- error_code eval
+[200, 200, 503]
+
+
+
+=== TEST 27: estimated charging with total_tokens strategy should include completion
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/routes/6',
+                 ngx.HTTP_PUT,
+                 [[{
+                    "uri": "/ai6",
+                    "plugins": {
+                        "ai-proxy": {
+                            "provider": "openai",
+                            "auth": {"header": {"Authorization": "Bearer token"}},
+                            "options": {
+                                "model": "gpt-35-turbo-instruct",
+                                "max_tokens": 512,
+                                "temperature": 1.0
+                            },
+                            "override": {"endpoint": "http://localhost:16724"},
+                            "ssl_verify": false
+                        },
+                        "ai-rate-limiting": {
+                            "limit": 18,
+                            "time_window": 60,
+                            "limit_strategy": "total_tokens",
+                            "enable_estimated_token_charging": true,
+                            "prompt_tokens_estimator_divisor": 4,
+                            "completion_tokens_estimator_divisor": 4
+                        }
+                    },
+                    "upstream": {
+                        "type": "roundrobin",
+                        "nodes": {"canbeanything.com": 1}
+                    }
+                }]]
+            )
+
+            if code >= 300 then
+                ngx.status = code
+            end
+            ngx.say(body)
+        }
+    }
+--- response_body
+passed
+
+
+
+=== TEST 28: total_tokens strategy should reject the 2nd request
+--- pipelined_requests eval
+[
+    "POST /ai6\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }",
+    "POST /ai6\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }"
+]
+--- more_headers
+Authorization: Bearer token
+--- error_code eval
+[200, 503]
+
+
+
+=== TEST 29: estimated charging with completion_tokens strategy
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/routes/7',
+                 ngx.HTTP_PUT,
+                 [[{
+                    "uri": "/ai7",
+                    "plugins": {
+                        "ai-proxy": {
+                            "provider": "openai",
+                            "auth": {"header": {"Authorization": "Bearer token"}},
+                            "options": {
+                                "model": "gpt-35-turbo-instruct",
+                                "max_tokens": 512,
+                                "temperature": 1.0
+                            },
+                            "override": {"endpoint": "http://localhost:16724"},
+                            "ssl_verify": false
+                        },
+                        "ai-rate-limiting": {
+                            "limit": 6,
+                            "time_window": 60,
+                            "limit_strategy": "completion_tokens",
+                            "enable_estimated_token_charging": true,
+                            "prompt_tokens_estimator_divisor": 4,
+                            "completion_tokens_estimator_divisor": 4
+                        }
+                    },
+                    "upstream": {
+                        "type": "roundrobin",
+                        "nodes": {"canbeanything.com": 1}
+                    }
+                }]]
+            )
+
+            if code >= 300 then
+                ngx.status = code
+            end
+            ngx.say(body)
+        }
+    }
+--- response_body
+passed
+
+
+
+=== TEST 30: completion_tokens strategy should reject the 3rd request
+--- pipelined_requests eval
+[
+    "POST /ai7\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }",
+    "POST /ai7\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }",
+    "POST /ai7\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": \"You are a mathematician\" }, { \"role\": \"user\", \"content\": \"What is 1+1?\"} ] }"
+]
+--- more_headers
+Authorization: Bearer token
+--- error_code eval
+[200, 200, 503]
+
+
+
+=== TEST 31: estimated charging should handle multipart object message content (OpenAI compatible)
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/routes/8',
+                 ngx.HTTP_PUT,
+                 [[{
+                    "uri": "/ai8",
+                    "plugins": {
+                        "ai-proxy": {
+                            "provider": "openai",
+                            "auth": {"header": {"Authorization": "Bearer token"}},
+                            "options": {
+                                "model": "gpt-35-turbo-instruct",
+                                "max_tokens": 512,
+                                "temperature": 1.0
+                            },
+                            "override": {"endpoint": "http://localhost:16724"},
+                            "ssl_verify": false
+                        },
+                        "ai-rate-limiting": {
+                            "limit": 25,
+                            "time_window": 60,
+                            "limit_strategy": "total_tokens",
+                            "enable_estimated_token_charging": true,
+                            "prompt_tokens_estimator_divisor": 4,
+                            "completion_tokens_estimator_divisor": 4
+                        }
+                    },
+                    "upstream": {
+                        "type": "roundrobin",
+                        "nodes": {"canbeanything.com": 1}
+                    }
+                }]]
+            )
+
+            if code >= 300 then
+                ngx.status = code
+            end
+            ngx.say(body)
+        }
+    }
+--- response_body
+passed
+
+
+
+=== TEST 32: multipart object message content should reject the 3rd request (not the 2nd)
+--- pipelined_requests eval
+[
+    "POST /ai8\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": {\"type\":\"text\",\"text\":\"You are a mathematician\"} }, { \"role\": \"user\", \"content\": {\"type\":\"text\",\"text\":\"What is 1+1?\"} } ] }",
+    "POST /ai8\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": {\"type\":\"text\",\"text\":\"You are a mathematician\"} }, { \"role\": \"user\", \"content\": {\"type\":\"text\",\"text\":\"What is 1+1?\"} } ] }",
+    "POST /ai8\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": {\"type\":\"text\",\"text\":\"You are a mathematician\"} }, { \"role\": \"user\", \"content\": {\"type\":\"text\",\"text\":\"What is 1+1?\"} } ] }"
+]
+--- more_headers
+Authorization: Bearer token
+--- error_code eval
+[200, 200, 503]
