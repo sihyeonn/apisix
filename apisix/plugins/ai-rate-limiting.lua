@@ -25,6 +25,16 @@ local plugin_name = "ai-rate-limiting"
 
 local MIN_ESTIMATED_TOKENS = 1
 
+local function should_charge_prompt(conf)
+    return conf.limit_strategy == "prompt_tokens" or conf.limit_strategy == "total_tokens"
+end
+
+
+local function should_charge_completion(conf)
+    return conf.limit_strategy == "completion_tokens" or conf.limit_strategy == "total_tokens"
+end
+
+
 local instance_limit_schema = {
     type = "object",
     properties = {
