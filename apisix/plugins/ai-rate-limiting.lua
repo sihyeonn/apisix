@@ -148,7 +148,25 @@ local function estimate_prompt_tokens(conf, ctx)
             if type(c) == "string" then
                 parts[#parts + 1] = c
             elseif type(c) == "table" then
-                parts[#parts + 1] = core.json.encode(c)
+                -- OpenAI-compatible providers may use multipart content like:
+                -- {"type":"text","text":"..."}. Prefer extracting text parts.
+                local extracted = false
+                if #c > 0 then
+                    for _, part in ipairs(c) do
+                        if type(part) == "table" and part.type == "text" and type(part.text) == "string" then
+                            parts[#parts + 1] = part.text
+                            extracted = true
+                        end
+                    end
+                elseif c.type == "text" and type(c.text) == "string" then
+                    parts[#parts + 1] = c.text
+                    extracted = true
+                end
+
+                if not extracted then
+                    -- Fallback: keep rough size without failing.
+                    parts[#parts + 1] = core.json.encode(c)
+                end
             end
         end
     end
