@@ -411,27 +411,23 @@ function _M.log(conf, ctx)
     if ctx.ai_rate_limiting then
         return
     end
+
+    local used_tokens = get_token_usage(conf, ctx)
+
+    local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
+    local limit_conf = limit_conf_kvs[instance_name]
+    if not limit_conf then
+        return
+    end
+
     if not conf.enable_estimated_token_charging then
-        local used_tokens = get_token_usage(conf, ctx)
         if not used_tokens then
             core.log.error("failed to get token usage for llm service")
             return
         end
 
         core.log.info("instance name: ", instance_name, " used tokens: ", used_tokens)
-
-        local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
-        local limit_conf = limit_conf_kvs[instance_name]
-        if limit_conf then
-            limit_count.rate_limit(limit_conf, ctx, plugin_name, used_tokens)
-        end
-        return
-    end
-
-    local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
-    local limit_conf = limit_conf_kvs[instance_name]
-
-    if not limit_conf then
+        limit_count.rate_limit(limit_conf, ctx, plugin_name, used_tokens)
         return
     end
 
@@ -452,7 +448,6 @@ function _M.log(conf, ctx)
         end
     end
 
-    local used_tokens = get_token_usage(conf, ctx)
     if used_tokens then
         core.log.info("instance name: ", instance_name, " used tokens (upstream usage): ", used_tokens,
             ", prompt_est=", ctx.ai_rate_limiting_prompt_tokens_est or 0,
