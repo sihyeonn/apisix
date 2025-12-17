@@ -1052,3 +1052,72 @@ passed
 Authorization: Bearer token
 --- error_code eval
 [200, 200, 503]
+
+
+=== TEST 23: estimated charging should handle multipart message content (OpenAI compatible)
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/routes/4',
+                 ngx.HTTP_PUT,
+                 [[{
+                    "uri": "/ai4",
+                    "plugins": {
+                        "ai-proxy": {
+                            "provider": "openai",
+                            "auth": {
+                                "header": {
+                                    "Authorization": "Bearer token"
+                                }
+                            },
+                            "options": {
+                                "model": "gpt-35-turbo-instruct",
+                                "max_tokens": 512,
+                                "temperature": 1.0
+                            },
+                            "override": {
+                                "endpoint": "http://localhost:16724"
+                            },
+                            "ssl_verify": false
+                        },
+                        "ai-rate-limiting": {
+                            "limit": 25,
+                            "time_window": 60,
+                            "limit_strategy": "total_tokens",
+                            "enable_estimated_token_charging": true,
+                            "prompt_tokens_estimator_divisor": 4,
+                            "completion_tokens_estimator_divisor": 4
+                        }
+                    },
+                    "upstream": {
+                        "type": "roundrobin",
+                        "nodes": {
+                            "canbeanything.com": 1
+                        }
+                    }
+                }]]
+            )
+
+            if code >= 300 then
+                ngx.status = code
+            end
+            ngx.say(body)
+        }
+    }
+--- response_body
+passed
+
+
+
+=== TEST 24: multipart message content should reject the 3rd request (not the 2nd)
+--- pipelined_requests eval
+[
+    "POST /ai4\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": [ {\"type\":\"text\",\"text\":\"You are a mathematician\"} ] }, { \"role\": \"user\", \"content\": [ {\"type\":\"text\",\"text\":\"What is 1+1?\"} ] } ] }",
+    "POST /ai4\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": [ {\"type\":\"text\",\"text\":\"You are a mathematician\"} ] }, { \"role\": \"user\", \"content\": [ {\"type\":\"text\",\"text\":\"What is 1+1?\"} ] } ] }",
+    "POST /ai4\n" . "{ \"messages\": [ { \"role\": \"system\", \"content\": [ {\"type\":\"text\",\"text\":\"You are a mathematician\"} ] }, { \"role\": \"user\", \"content\": [ {\"type\":\"text\",\"text\":\"What is 1+1?\"} ] } ] }"
+]
+--- more_headers
+Authorization: Bearer token
+--- error_code eval
+[200, 200, 503]
